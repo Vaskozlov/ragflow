@@ -46,7 +46,7 @@ from deepdoc.parser.utils import extract_pdf_outlines
 
 AlgorithmType = Literal["PaddleOCR-VL", "PaddleOCR-VL-1.6", "PP-OCRv5", "PP-OCRv6", "PP-StructureV3", "PaddleOCR-VL-1.5"]
 SectionTuple = tuple[str, ...]
-TableTuple = tuple[str, ...]
+TableTuple = tuple[tuple[Image.Image, list[str]], list[tuple[int, int, int, int, int]]]
 ParseResult = tuple[list[SectionTuple], list[TableTuple]]
 SUPPORTED_PADDLEOCR_ALGORITHMS: tuple[AlgorithmType, ...] = (
     "PaddleOCR-VL",
@@ -180,6 +180,7 @@ class PaddleOCRParser(RAGFlowPdfParser):
     """Parser for PDF documents using PaddleOCR API."""
 
     _ZOOMIN = 2
+    _FIGURE_LABELS: ClassVar[frozenset[str]] = frozenset({"figure", "image", "chart", "diagram", "illustration", "picture"})
 
     _COMMON_FIELD_MAPPING: ClassVar[dict[str, str]] = {
         "prettify_markdown": "prettifyMarkdown",
@@ -217,6 +218,8 @@ class PaddleOCRParser(RAGFlowPdfParser):
 
     _ALGORITHM_FIELD_MAPPINGS: ClassVar[dict[str, dict[str, str]]] = {
         "PaddleOCR-VL": _VL_FIELD_MAPPING,
+        "PaddleOCR-VL-1.6": _VL_FIELD_MAPPING,
+        "PP-OCRv6": _VL_FIELD_MAPPING,
         "PP-OCRv5": _VL_FIELD_MAPPING,
         "PP-StructureV3": _VL_FIELD_MAPPING,
         "PaddleOCR-VL-1.5": _VL_FIELD_MAPPING,
@@ -576,6 +579,10 @@ class PaddleOCRParser(RAGFlowPdfParser):
                 parsing_res_list = pruned_result.get("parsing_res_list", [])
 
                 for block in parsing_res_list:
+                    label = block.get("block_label", "")
+                    if self._is_figure_label(label):
+                        continue
+
                     block_content = block.get("block_content", "").strip()
                     if not block_content:
                         continue
@@ -583,7 +590,6 @@ class PaddleOCRParser(RAGFlowPdfParser):
                     # Remove images
                     block_content = _remove_images_from_markdown(block_content)
 
-                    label = block.get("block_label", "")
                     block_bbox = block.get("block_bbox", [0, 0, 0, 0])
                     left, top, right, bottom = _normalize_bbox(block_bbox)
 
@@ -598,9 +604,51 @@ class PaddleOCRParser(RAGFlowPdfParser):
 
         return sections
 
+    @classmethod
+    def _is_figure_label(cls, label: Any) -> bool:
+        if not isinstance(label, str):
+            return False
+        normalized = re.sub(r"[\s_-]+", " ", label.strip().lower())
+        return normalized in cls._FIGURE_LABELS
+
     def _transfer_to_tables(self, result: dict[str, Any]) -> list[TableTuple]:
-        """Convert API response to table tuples."""
-        return []
+        """Convert PaddleOCR figure blocks into RAGFlow image items."""
+        figures: list[TableTuple] = []
+        page_images = self.page_images or []
+
+        for page_idx, layout_result in enumerate(result.get("layoutParsingResults", [])):
+            if page_idx >= len(page_images):
+                self.logger.warning("[PaddleOCR] Missing page image for figure blocks on page %s", page_idx + 1)
+                continue
+
+            page_image = page_images[page_idx]
+            page_width, page_height = page_image.size
+            parsing_res_list = layout_result.get("prunedResult", {}).get("parsing_res_list", [])
+
+            for block in parsing_res_list:
+                if not self._is_figure_label(block.get("block_label")):
+                    continue
+
+                block_bbox = block.get("block_bbox", [])
+                if not isinstance(block_bbox, (list, tuple)) or len(block_bbox) < 4:
+                    self.logger.warning("[PaddleOCR] Figure block on page %s has no valid bounding box", page_idx + 1)
+                    continue
+
+                left, top, right, bottom = _normalize_bbox(block_bbox)
+                left = max(0, min(page_width, int(left // self._ZOOMIN)))
+                top = max(0, min(page_height, int(top // self._ZOOMIN)))
+                right = max(0, min(page_width, int(right // self._ZOOMIN)))
+                bottom = max(0, min(page_height, int(bottom // self._ZOOMIN)))
+                if right <= left or bottom <= top:
+                    self.logger.warning("[PaddleOCR] Figure block on page %s has an empty bounding box", page_idx + 1)
+                    continue
+
+                image = page_image.crop((left, top, right, bottom))
+                caption = _remove_images_from_markdown(str(block.get("block_content") or "")).strip()
+                positions = [(page_idx + self.page_from, left, right, top, bottom)]
+                figures.append(((image, [caption]), positions))
+
+        return figures
 
     def __images__(self, fnm, page_from=0, page_to=MAXIMUM_PAGE_NUMBER, callback=None):
         """Generate page images from PDF for cropping."""
