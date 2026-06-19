@@ -705,9 +705,15 @@ def attach_media_context(chunks, table_context_size=0, image_context_size=0):
 
 
 def append_context2table_image4pdf(sections: list, tabls: list, table_context_size=0, return_context=False):
-    from deepdoc.parser import PdfParser
     if table_context_size <=0:
         return [] if return_context else tabls
+
+    def extract_positions(text):
+        positions = []
+        for tag in re.findall(r"@@[0-9-]+\t[0-9.\t]+##", text):
+            page, left, right, top, bottom = tag.strip("#").strip("@").split("\t")
+            positions.append(([int(value) - 1 for value in page.split("-")], float(left), float(right), float(top), float(bottom)))
+        return positions
 
     page_bucket = defaultdict(list)
     for i, item in enumerate(sections):
@@ -728,10 +734,10 @@ def append_context2table_image4pdf(sections: list, tabls: list, table_context_si
         elif isinstance(poss, str):
             if "@@" not in poss and isinstance(txt, str) and "@@" in txt:
                 poss = txt
-            poss = PdfParser.extract_positions(poss)
+            poss = extract_positions(poss)
         else:
             if isinstance(txt, str) and "@@" in txt:
-                poss = PdfParser.extract_positions(txt)
+                poss = extract_positions(txt)
             else:
                 poss = []
         if isinstance(txt, str) and "@@" in txt:
@@ -741,44 +747,30 @@ def append_context2table_image4pdf(sections: list, tabls: list, table_context_si
                 page = page[0] if page else 0
             page_bucket[page].append(((left, right, top, bottom), txt))
 
-    def upper_context(page, i):
+    def upper_context(page, media_top):
         txt = ""
-        if page not in page_bucket:
-            i = -1
-        while num_tokens_from_string(txt) < table_context_size:
-            if i < 0:
-                page -= 1
-                if page < 0 or page not in page_bucket:
-                    break
-                i = len(page_bucket[page]) -1
-            blks = page_bucket[page]
-            (_, _, _, _), cnt = blks[i]
+        blocks = sorted(page_bucket.get(page, []), key=lambda item: (item[0][2], item[0][0]))
+        for (_, _, _, bottom), cnt in reversed(blocks):
+            if bottom > media_top:
+                continue
             txts = re.split(r"([。!?？；！\n]|\. )", cnt, flags=re.DOTALL)[::-1]
             for j in range(0, len(txts), 2):
-                txt = (txts[j+1] if j+1<len(txts) else "") + txts[j] + txt
+                txt = (txts[j + 1] if j + 1 < len(txts) else "") + txts[j] + txt
                 if num_tokens_from_string(txt) > table_context_size:
-                    break
-            i -= 1
+                    return txt
         return txt
 
-    def lower_context(page, i):
+    def lower_context(page, media_bottom):
         txt = ""
-        if page not in page_bucket:
-            return txt
-        while num_tokens_from_string(txt) < table_context_size:
-            if i >= len(page_bucket[page]):
-                page += 1
-                if page not in page_bucket:
-                    break
-                i = 0
-            blks = page_bucket[page]
-            (_, _, _, _), cnt = blks[i]
+        blocks = sorted(page_bucket.get(page, []), key=lambda item: (item[0][2], item[0][0]))
+        for (_, _, top, _), cnt in blocks:
+            if top < media_bottom:
+                continue
             txts = re.split(r"([。!?？；！\n]|\. )", cnt, flags=re.DOTALL)
             for j in range(0, len(txts), 2):
-                txt += txts[j] + (txts[j+1] if j+1<len(txts) else "")
+                txt += txts[j] + (txts[j + 1] if j + 1 < len(txts) else "")
                 if num_tokens_from_string(txt) > table_context_size:
-                    break
-            i += 1
+                    return txt
         return txt
 
     res = []
@@ -789,42 +781,10 @@ def append_context2table_image4pdf(sections: list, tabls: list, table_context_si
         if isinstance(tb, list):
             tb = "\n".join(tb)
 
-        i = 0
-        blks = page_bucket.get(page, [])
-        _tb = tb
-        while i < len(blks):
-            if i + 1 >= len(blks):
-                if _page > page:
-                    page += 1
-                    i = 0
-                    blks = page_bucket.get(page, [])
-                    continue
-                upper = upper_context(page, i)
-                lower = lower_context(page + 1, 0)
-                tb = upper + tb + lower
-                contexts.append((upper.strip(), lower.strip()))
-                break
-            (_, _, t, b), txt = blks[i]
-            if b > top:
-                break
-            (_, _, _t, _b), _txt = blks[i+1]
-            if _t < _bott:
-                i += 1
-                continue
-
-            upper = upper_context(page, i)
-            lower = lower_context(page, i)
-            tb = upper + tb + lower
-            contexts.append((upper.strip(), lower.strip()))
-            break
-
-        if _tb == tb:
-            upper = upper_context(page, -1)
-            lower = lower_context(page + 1, 0)
-            tb = upper + tb + lower
-            contexts.append((upper.strip(), lower.strip()))
-        if len(contexts) < len(res) + 1:
-            contexts.append(("", ""))
+        upper = upper_context(page, top).strip()
+        lower = lower_context(_page, _bott).strip()
+        tb = "\n".join(part for part in (upper, tb.strip(), lower) if part)
+        contexts.append((upper, lower))
         res.append(((img, tb), poss))
     return contexts if return_context else res
 
