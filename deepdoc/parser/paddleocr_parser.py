@@ -14,11 +14,15 @@
 #
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import re
+import subprocess
+import sys
 import tempfile
+import threading
 import time
 from dataclasses import asdict, dataclass, field, fields
 from io import BytesIO
@@ -42,6 +46,11 @@ except Exception:
 
 
 from deepdoc.parser.utils import extract_pdf_outlines
+
+
+LOCK_KEY_PDFPLUMBER = "global_shared_lock_pdfplumber"
+if LOCK_KEY_PDFPLUMBER not in sys.modules:
+    sys.modules[LOCK_KEY_PDFPLUMBER] = threading.Lock()
 
 
 AlgorithmType = Literal["PaddleOCR-VL", "PaddleOCR-VL-1.6", "PP-OCRv5", "PP-OCRv6", "PP-StructureV3", "PaddleOCR-VL-1.5"]
@@ -247,6 +256,7 @@ class PaddleOCRParser(RAGFlowPdfParser):
         # Initialize page images for cropping
         self.page_images: list[Image.Image] = []
         self.page_from = 0
+        self._missing_page_images_warned = False
 
     # Public methods
     def check_installation(self) -> tuple[bool, str]:
@@ -615,8 +625,22 @@ class PaddleOCRParser(RAGFlowPdfParser):
         """Convert PaddleOCR figure blocks into RAGFlow image items."""
         figures: list[TableTuple] = []
         page_images = self.page_images or []
+        layout_results = result.get("layoutParsingResults", [])
 
-        for page_idx, layout_result in enumerate(result.get("layoutParsingResults", [])):
+        if not page_images and layout_results:
+            page_images = self._restore_page_images_from_result(layout_results)
+            if page_images:
+                self.page_images = page_images
+
+        if not page_images:
+            if layout_results:
+                self.logger.warning(
+                    "[PaddleOCR] Page rendering unavailable; skipping figure extraction for %s pages",
+                    len(layout_results),
+                )
+            return figures
+
+        for page_idx, layout_result in enumerate(layout_results):
             if page_idx >= len(page_images):
                 self.logger.warning("[PaddleOCR] Missing page image for figure blocks on page %s", page_idx + 1)
                 continue
@@ -650,17 +674,121 @@ class PaddleOCRParser(RAGFlowPdfParser):
 
         return figures
 
+    def _restore_page_images_from_result(self, layout_results: list[dict[str, Any]]) -> list[Image.Image]:
+        """Restore 72-DPI page images from PaddleX result payloads."""
+        page_images: list[Image.Image] = []
+
+        for page_idx, layout_result in enumerate(layout_results):
+            encoded_image = layout_result.get("inputImage")
+            if not isinstance(encoded_image, str) or not encoded_image:
+                for image in page_images:
+                    image.close()
+                self.logger.warning("[PaddleOCR] Result has no inputImage for page %s", page_idx + 1)
+                return []
+
+            try:
+                if encoded_image.startswith("data:"):
+                    encoded_image = encoded_image.split(",", 1)[1]
+                image_bytes = base64.b64decode(encoded_image)
+                with Image.open(BytesIO(image_bytes)) as image:
+                    image = image.convert("RGB")
+                    target_size = (
+                        max(1, int(image.width // self._ZOOMIN)),
+                        max(1, int(image.height // self._ZOOMIN)),
+                    )
+                    page_images.append(image.resize(target_size, Image.Resampling.LANCZOS))
+            except Exception as exc:
+                for image in page_images:
+                    image.close()
+                self.logger.warning("[PaddleOCR] Failed to restore inputImage for page %s: %s", page_idx + 1, exc)
+                return []
+
+        self.logger.info("[PaddleOCR] Restored %s page images from PaddleOCR results", len(page_images))
+        return page_images
+
+    def _render_pages_with_ghostscript(self, fnm, page_from: int, page_to: int) -> list[Image.Image]:
+        """Render PDF pages with Ghostscript when PDFium rejects the document."""
+        timeout = float(os.getenv("PADDLEOCR_RENDER_TIMEOUT", "1800"))
+
+        with tempfile.TemporaryDirectory(prefix="ragflow-paddleocr-") as temp_dir:
+            temp_path = Path(temp_dir)
+            if isinstance(fnm, (str, PathLike)):
+                input_path = Path(fnm)
+            else:
+                input_path = temp_path / "input.pdf"
+                if isinstance(fnm, (bytes, bytearray)):
+                    pdf_bytes = bytes(fnm)
+                elif isinstance(fnm, BytesIO):
+                    pdf_bytes = fnm.getbuffer().tobytes()
+                else:
+                    raise TypeError(f"Unsupported PDF input type: {type(fnm).__name__}")
+                input_path.write_bytes(pdf_bytes)
+
+            output_pattern = temp_path / "page-%06d.png"
+            command = [
+                "gs",
+                "-q",
+                "-dSAFER",
+                "-dBATCH",
+                "-dNOPAUSE",
+                "-sDEVICE=png16m",
+                "-dTextAlphaBits=4",
+                "-dGraphicsAlphaBits=4",
+                "-r72",
+                f"-dFirstPage={page_from + 1}",
+                f"-dLastPage={page_to}",
+                f"-sOutputFile={output_pattern}",
+                str(input_path),
+            ]
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            if completed.returncode != 0:
+                error = (completed.stderr or completed.stdout or "unknown Ghostscript error").strip()
+                raise RuntimeError(f"Ghostscript exited with status {completed.returncode}: {error[-1000:]}")
+
+            page_images = []
+            for image_path in sorted(temp_path.glob("page-*.png")):
+                with Image.open(image_path) as image:
+                    page_images.append(image.convert("RGB").copy())
+            if not page_images:
+                raise RuntimeError("Ghostscript did not render any pages")
+            return page_images
+
     def __images__(self, fnm, page_from=0, page_to=MAXIMUM_PAGE_NUMBER, callback=None):
         """Generate page images from PDF for cropping."""
         self.page_from = page_from
         self.page_to = page_to
+        self._missing_page_images_warned = False
         try:
-            with pdfplumber.open(fnm) if isinstance(fnm, (str, PathLike)) else pdfplumber.open(BytesIO(fnm)) as pdf:
-                self.pdf = pdf
-                self.page_images = [p.to_image(resolution=72, antialias=True).original for i, p in enumerate(self.pdf.pages[page_from:page_to])]
-        except Exception as e:
-            self.page_images = None
-            self.logger.exception(e)
+            with sys.modules[LOCK_KEY_PDFPLUMBER]:
+                if isinstance(fnm, (str, PathLike)):
+                    pdf_source = fnm
+                elif isinstance(fnm, (bytes, bytearray)):
+                    pdf_source = BytesIO(fnm)
+                elif isinstance(fnm, BytesIO):
+                    pdf_source = BytesIO(fnm.getbuffer())
+                else:
+                    raise TypeError(f"Unsupported PDF input type: {type(fnm).__name__}")
+
+                with pdfplumber.open(pdf_source) as pdf:
+                    self.pdf = pdf
+                    self.page_images = [p.to_image(resolution=72, antialias=True).original for i, p in enumerate(self.pdf.pages[page_from:page_to])]
+        except Exception as pdfium_error:
+            self.logger.warning("[PaddleOCR] PDFium rendering failed; retrying with Ghostscript: %s", pdfium_error)
+            try:
+                self.page_images = self._render_pages_with_ghostscript(fnm, page_from, page_to)
+                self.logger.info("[PaddleOCR] Ghostscript rendered %s pages", len(self.page_images))
+            except Exception as ghostscript_error:
+                self.page_images = []
+                self.logger.warning(
+                    "[PaddleOCR] Ghostscript rendering also failed; continuing without page images: %s",
+                    ghostscript_error,
+                )
 
     @staticmethod
     def extract_positions(txt: str):
@@ -683,7 +811,9 @@ class PaddleOCRParser(RAGFlowPdfParser):
             return
 
         if not getattr(self, "page_images", None):
-            self.logger.warning("[PaddleOCR] crop called without page images; skipping image generation.")
+            if not self._missing_page_images_warned:
+                self.logger.warning("[PaddleOCR] crop called without page images; skipping image generation.")
+                self._missing_page_images_warned = True
             if need_position:
                 return None, None
             return
