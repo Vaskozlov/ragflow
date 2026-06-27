@@ -62,6 +62,24 @@ In a knowledge graph, a community is a cluster of entities linked by relationshi
 - Generate community reports. This option consumes more tokens.
 - (Default) Do not generate community reports.
 
+### Timeout controls
+
+GraphRAG build, merge, entity-resolution, and community-report stages have their own timeout and retry controls. Dataset-level `parser_config.graphrag` values take precedence by default. For Docker deployments, you can set the following variables in `docker/.env`; set `GRAPHRAG_CONFIG_ENV_OVERRIDE=true` only when you want these environment values to override existing dataset parser configurations:
+
+```env
+GRAPHRAG_CONFIG_ENV_OVERRIDE=false
+GRAPHRAG_MERGE_TIMEOUT_SECONDS=1800
+GRAPHRAG_MERGE_RETRY_ATTEMPTS=1
+GRAPHRAG_LOCK_ACQUIRE_TIMEOUT_SECONDS=1800
+GRAPHRAG_RESOLUTION_TIMEOUT_SECONDS=3600
+GRAPHRAG_COMMUNITY_TIMEOUT_SECONDS=3600
+GRAPHRAG_RETRY_ATTEMPTS=1
+GRAPHRAG_RETRY_BACKOFF_SECONDS=2
+GRAPHRAG_RETRY_BACKOFF_MAX_SECONDS=30
+```
+
+`LLM_TIMEOUT_SECONDS` controls LLM chat calls only. It does not control the GraphRAG merge stage. Leave `ENABLE_TIMEOUT_ASSERTION` unset unless you are intentionally debugging timeout assertions; do not set it to `0` as a normal configuration value.
+
 ## Quickstart
 
 1. Navigate to the **Configuration** page of your dataset and update:
